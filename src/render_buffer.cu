@@ -230,7 +230,6 @@ const float* GLTexture::CUDAMapping::data_cpu() {
 __global__ void accumulate_kernel(ivec2 resolution, vec4* frame_buffer, vec4* accumulate_buffer, float sample_count, EColorSpace color_space) {
 	uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
 	uint32_t y = threadIdx.y + blockDim.y * blockIdx.y;
-
 	if (x >= resolution.x || y >= resolution.y) {
 		return;
 	}
@@ -239,7 +238,6 @@ __global__ void accumulate_kernel(ivec2 resolution, vec4* frame_buffer, vec4* ac
 
 	vec4 color = frame_buffer[idx];
 	vec4 tmp = accumulate_buffer[idx];
-
 	switch (color_space) {
 		case EColorSpace::VisPosNeg:
 			{
@@ -632,15 +630,15 @@ void CudaRenderBuffer::clear_frame(cudaStream_t stream) {
 
 void CudaRenderBuffer::accumulate(float exposure, cudaStream_t stream) {
 	ivec2 res = in_resolution();
-
 	uint32_t accum_spp = m_dlss ? 0 : m_spp;
-
+	cudaSetDevice(0);
 	if (accum_spp == 0) {
 		CUDA_CHECK_THROW(cudaMemsetAsync(m_accumulate_buffer.data(), 0, m_accumulate_buffer.bytes(), stream));
 	}
-
+	cudaDeviceSynchronize();
 	const dim3 threads = { 16, 8, 1 };
 	const dim3 blocks = { div_round_up((uint32_t)res.x, threads.x), div_round_up((uint32_t)res.y, threads.y), 1 };
+	std::cout << "accum_spp:" << accum_spp << " blocks: " << div_round_up((uint32_t)res.y, threads.y)<< std::endl;
 	accumulate_kernel<<<blocks, threads, 0, stream>>>(
 		res,
 		frame_buffer(),
@@ -648,7 +646,7 @@ void CudaRenderBuffer::accumulate(float exposure, cudaStream_t stream) {
 		(float)accum_spp,
 		m_color_space
 	);
-
+	std::cout << "accum_spp:" << accum_spp << " blocks: " << div_round_up((uint32_t)res.y, threads.y)<< std::endl;
 	++m_spp;
 }
 

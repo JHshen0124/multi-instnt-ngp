@@ -15,6 +15,9 @@
 *.ingp
 *.msgpack
 *.training
+*.png
+*.mp4
+data/*
 __pycache__
 .DS_Store
 imgui.ini

@@ -26,6 +26,7 @@
 #include <pybind11_json/pybind11_json.hpp>
 
 #include <filesystem/path.h>
+#include <chrono>
 
 #ifdef NGP_GUI
 #  include <imgui/imgui.h>
@@ -124,19 +125,113 @@ pybind11::dict Testbed::compute_marching_cubes_mesh(ivec3 res3d, BoundingBox aab
 	return py::dict("V"_a=cpuverts, "N"_a=cpunormals, "C"_a=cpucolors, "F"_a=cpuindices);
 }
 
+// py::array_t<float> Testbed::render_to_cpu(int width, int height, int spp, bool linear, float start_time, float end_time, float fps, float shutter_fraction) {
+// 	m_windowless_render_surface.resize({width, height});
+// 	m_windowless_render_surface.reset_accumulation();
+
+// 	if (end_time < 0.f) {
+// 		end_time = start_time;
+// 	}
+
+// 	bool path_animation_enabled = start_time >= 0.f;
+// 	if (!path_animation_enabled) { // the old code disabled camera smoothing for non-path renders; so we preserve that behaviour
+// 		m_smoothed_camera = m_camera;
+// 	}
+
+// 	// this rendering code assumes that the intra-frame camera motion starts from m_smoothed_camera (ie where we left off) to allow for EMA camera smoothing.
+// 	// in the case of a camera path animation, at the very start of the animation, we have yet to initialize smoothed_camera to something sensible
+// 	// - it will just be the default boot position. oops!
+// 	// that led to the first frame having a crazy streak from the default camera position to the start of the path.
+// 	// so we detect that case and explicitly force the current matrix to the start of the path
+// 	if (start_time == 0.f) {
+// 		set_camera_from_time(start_time);
+// 		m_smoothed_camera = m_camera;
+// 	}
+
+// 	auto start_cam_matrix = m_smoothed_camera;
+
+// 	// now set up the end-of-frame camera matrix if we are moving along a path
+// 	if (path_animation_enabled) {
+// 		set_camera_from_time(end_time);
+// 		apply_camera_smoothing(1000.f / fps);
+// 	}
+
+// 	auto end_cam_matrix = m_smoothed_camera;
+// 	auto prev_camera_matrix = m_smoothed_camera;
+
+// 	auto start = std::chrono::high_resolution_clock::now();
+// 	for (int i = 0; i < spp; ++i) {
+// 		float start_alpha = ((float)i)/(float)spp * shutter_fraction;
+// 		float end_alpha = ((float)i + 1.0f)/(float)spp * shutter_fraction;
+
+// 		auto sample_start_cam_matrix = start_cam_matrix;
+// 		auto sample_end_cam_matrix = camera_lerp(start_cam_matrix, end_cam_matrix, shutter_fraction);
+// 		if (i == 0) {
+// 			prev_camera_matrix = sample_start_cam_matrix;
+// 		}
+
+// 		if (path_animation_enabled) {
+// 			set_camera_from_time(start_time + (end_time-start_time) * (start_alpha + end_alpha) / 2.0f);
+// 			m_smoothed_camera = m_camera;
+// 		}
+
+// 		if (m_autofocus) {
+// 			autofocus();
+// 		}
+
+// 		render_frame(
+// 			m_stream.get(),
+// 			sample_start_cam_matrix,
+// 			sample_end_cam_matrix,
+// 			prev_camera_matrix,
+// 			m_screen_center,
+// 			m_relative_focal_length,
+// 			{0.0f, 0.0f, 0.0f, 1.0f},
+// 			{},
+// 			{},
+// 			m_visualized_dimension,
+// 			m_windowless_render_surface,
+// 			!linear
+// 		);
+// 		prev_camera_matrix = sample_start_cam_matrix;
+// 	}
+// 	auto end = std::chrono::high_resolution_clock::now();
+// 	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+// 	std::cout << "Rendered " << spp << " samples in " << elapsed << "ms" << std::endl;
+// 	// For cam smoothing when rendering the next frame.
+// 	m_smoothed_camera = end_cam_matrix;
+
+// 	py::array_t<float> result({height, width, 4});
+// 	py::buffer_info buf = result.request();
+
+// 	CUDA_CHECK_THROW(cudaMemcpy2DFromArray(buf.ptr, width * sizeof(float) * 4, m_windowless_render_surface.surface_provider().array(), 0, 0, width * sizeof(float) * 4, height, cudaMemcpyDeviceToHost));
+// 	return result;
+// }
+
 py::array_t<float> Testbed::render_to_cpu(int width, int height, int spp, bool linear, float start_time, float end_time, float fps, float shutter_fraction) {
+	cudaSetDevice(0);
+	std::vector<CudaRenderBuffer> m_windowless_render_surfaces;
+	std::vector<std::shared_ptr<CudaSurface2D>> surfaces;
+	
+	for(int i = 0;i< m_devices.size();i++){
+		std::shared_ptr<CudaSurface2D> surface = std::make_shared<CudaSurface2D>();
+		surfaces.push_back(surface);
+		CudaRenderBuffer buffer{surface};
+		buffer.resize({width, height});
+		buffer.reset_accumulation();
+		m_windowless_render_surfaces.push_back(std::move(buffer));
+	}
+	
 	m_windowless_render_surface.resize({width, height});
 	m_windowless_render_surface.reset_accumulation();
 
 	if (end_time < 0.f) {
 		end_time = start_time;
 	}
-
 	bool path_animation_enabled = start_time >= 0.f;
 	if (!path_animation_enabled) { // the old code disabled camera smoothing for non-path renders; so we preserve that behaviour
 		m_smoothed_camera = m_camera;
 	}
-
 	// this rendering code assumes that the intra-frame camera motion starts from m_smoothed_camera (ie where we left off) to allow for EMA camera smoothing.
 	// in the case of a camera path animation, at the very start of the animation, we have yet to initialize smoothed_camera to something sensible
 	// - it will just be the default boot position. oops!
@@ -158,6 +253,7 @@ py::array_t<float> Testbed::render_to_cpu(int width, int height, int spp, bool l
 	auto end_cam_matrix = m_smoothed_camera;
 	auto prev_camera_matrix = m_smoothed_camera;
 
+	auto start = std::chrono::high_resolution_clock::now();
 	for (int i = 0; i < spp; ++i) {
 		float start_alpha = ((float)i)/(float)spp * shutter_fraction;
 		float end_alpha = ((float)i + 1.0f)/(float)spp * shutter_fraction;
@@ -177,8 +273,7 @@ py::array_t<float> Testbed::render_to_cpu(int width, int height, int spp, bool l
 			autofocus();
 		}
 
-		render_frame(
-			m_stream.get(),
+		render_frame_multi_devices(
 			sample_start_cam_matrix,
 			sample_end_cam_matrix,
 			prev_camera_matrix,
@@ -188,19 +283,22 @@ py::array_t<float> Testbed::render_to_cpu(int width, int height, int spp, bool l
 			{},
 			{},
 			m_visualized_dimension,
-			m_windowless_render_surface,
+			m_windowless_render_surfaces,
 			!linear
 		);
 		prev_camera_matrix = sample_start_cam_matrix;
 	}
-
+	auto end = std::chrono::high_resolution_clock::now();
+	auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+	std::cout << "Rendered " << spp << " samples in " << elapsed << "ms" << std::endl;
 	// For cam smoothing when rendering the next frame.
 	m_smoothed_camera = end_cam_matrix;
 
 	py::array_t<float> result({height, width, 4});
 	py::buffer_info buf = result.request();
 
-	CUDA_CHECK_THROW(cudaMemcpy2DFromArray(buf.ptr, width * sizeof(float) * 4, m_windowless_render_surface.surface_provider().array(), 0, 0, width * sizeof(float) * 4, height, cudaMemcpyDeviceToHost));
+	CUDA_CHECK_THROW(cudaMemcpy2DFromArray(buf.ptr, width * sizeof(float) * 4, m_windowless_render_surfaces[0].surface_provider().array(), 0, 0, width * sizeof(float) * 4, height, cudaMemcpyDeviceToHost));
+	
 	return result;
 }
 

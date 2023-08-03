@@ -495,7 +495,10 @@ inline NGP_HOST_DEVICE Ray uv_to_ray(
 	vec3 head_pos = {parallax_shift.x, parallax_shift.y, 0.f};
 	dir -= head_pos * parallax_shift.z; // we could use focus_z here in the denominator. for now, we pack m_scale in here.
 	dir = mat3(camera_matrix) * dir;
-
+	int device;
+    cudaGetDevice(&device);
+	if(device > 0 )
+		printf("Device ID in kernel function: %d\n", device);
 	vec3 origin = mat3(camera_matrix) * head_pos + camera_matrix[3];
 	if (aperture_size != 0.0f) {
 		vec3 lookat = origin + dir * focus_z;

@@ -176,6 +176,43 @@ public:
 			cudaStream_t stream
 		);
 
+		void init_rays_from_camera_multi_devices(
+			uint32_t sample_index,
+			uint32_t padded_output_width,
+			uint32_t n_extra_dims,
+			const ivec2& resolution,
+			const vec2& focal_length,
+			const mat4x3& camera_matrix0,
+			const mat4x3& camera_matrix1,
+			const vec4& rolling_shutter,
+			const vec2& screen_center,
+			const vec3& parallax_shift,
+			bool snap_to_pixel_centers,
+			const BoundingBox& render_aabb,
+			const mat3& render_aabb_to_local,
+			float near_distance,
+			float plane_z,
+			float aperture_size,
+			const Foveation& foveation,
+			const Lens& lens,
+			const Buffer2DView<const vec4>& envmap,
+			const Buffer2DView<const vec2>& distortion,
+			vec4* frame_buffer,
+			float* depth_buffer,
+			const Buffer2DView<const uint8_t>& hidden_area_mask,
+			const uint8_t* grid,
+			int show_accel,
+			uint32_t max_mip,
+			float cone_angle_constant,
+			int n_pixels,
+			int y_offset,
+			int y_stride,
+			ERenderMode render_mode,
+			RaysNerfSoa *m_rays,
+			RaysNerfSoa &m_rays_hit,
+			cudaStream_t stream
+		);
+
 		uint32_t trace(
 			NerfNetwork<precision_t>& network,
 			const BoundingBox& render_aabb,
@@ -200,7 +237,34 @@ public:
 			cudaStream_t stream
 		);
 
+		uint32_t trace_multi_devices(
+			NerfNetwork<precision_t>& network,
+			const BoundingBox& render_aabb,
+			const mat3& render_aabb_to_local,
+			const BoundingBox& train_aabb,
+			const vec2& focal_length,
+			float cone_angle_constant,
+			const uint8_t* grid,
+			ERenderMode render_mode,
+			const mat4x3 &camera_matrix,
+			float depth_scale,
+			int visualized_layer,
+			int visualized_dim,
+			ENerfActivation rgb_activation,
+			ENerfActivation density_activation,
+			int show_accel,
+			uint32_t max_mip,
+			float min_transmittance,
+			float glow_y_cutoff,
+			int glow_mode,
+			const float* extra_dims_gpu,
+			RaysNerfSoa *m_rays,
+			RaysNerfSoa &m_rays_hit,
+			cudaStream_t stream
+		);
+
 		void enlarge(size_t n_elements, uint32_t padded_output_width, uint32_t n_extra_dims, cudaStream_t stream);
+		void enlarge_multi_devices(size_t n_elements, uint32_t padded_output_width, uint32_t n_extra_dims, RaysNerfSoa* m_rays,RaysNerfSoa &m_rays_hit,cudaStream_t stream);
 		RaysNerfSoa& rays_hit() { return m_rays_hit; }
 		RaysNerfSoa& rays_init() { return m_rays[0]; }
 		uint32_t n_rays_initialized() const { return m_n_rays_initialized; }
@@ -279,6 +343,17 @@ public:
 	class CudaDevice;
 
 	const float* get_inference_extra_dims(cudaStream_t stream) const;
+	void render_nerf_multi_device(
+		std::vector<CudaDevice>& devices,
+		const vec2& focal_length,
+		const mat4x3& camera_matrix0,
+		const mat4x3& camera_matrix1,
+		const vec4& rolling_shutter,
+		const vec2& screen_center,
+		const Foveation& foveation,
+		int visualized_dimension
+	);
+
 	void render_nerf(
 		cudaStream_t stream,
 		const CudaRenderBufferView& render_buffer,
@@ -335,6 +410,32 @@ public:
 		CudaRenderBuffer& render_buffer,
 		bool to_srgb = true,
 		CudaDevice* device = nullptr
+	);
+
+	void render_frame_multi_devices(
+		const mat4x3& camera_matrix0,
+		const mat4x3& camera_matrix1,
+		const mat4x3& prev_camera_matrix,
+		const vec2& screen_center,
+		const vec2& relative_focal_length,
+		const vec4& nerf_rolling_shutter,
+		const Foveation& foveation,
+		const Foveation& prev_foveation,
+		int visualized_dimension,
+		std::vector<CudaRenderBuffer>& render_buffer,
+		bool to_srgb = true,
+		CudaDevice* device = nullptr
+	);
+
+	void render_frame_main_multi_devices(
+		std::vector<CudaDevice>& devices,
+		const mat4x3& camera_matrix0,
+		const mat4x3& camera_matrix1,
+		const vec2& screen_center,
+		const vec2& relative_focal_length,
+		const vec4& nerf_rolling_shutter,
+		const Foveation& foveation,
+		int visualized_dimension
 	);
 	void render_frame_main(
 		CudaDevice& device,
@@ -1201,10 +1302,12 @@ public:
 		ivec2 resolution;
 
 		Buffer2DView<const vec2> inference_view() const {
+			std::cout << "inference view" << std::endl;
 			if (!map) {
+				std::cout << "inference view  !map" << std::endl;
 				return {};
 			}
-
+			
 			return {(const vec2*)map->inference_params(), resolution};
 		}
 

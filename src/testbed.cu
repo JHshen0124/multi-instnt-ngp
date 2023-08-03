@@ -3753,7 +3753,7 @@ void Testbed::reset_network(bool clear_density_grid) {
 				m_sdf.triangle_octree,
 				tcnn::string_to_interpolation_type(encoding_config.value("interpolation", "linear"))
 			));
-
+ 
 			m_sdf.uses_takikawa_encoding = true;
 		} else {
 			m_encoding.reset(create_encoding<precision_t>(dims.n_input, encoding_config));
@@ -3853,15 +3853,15 @@ Testbed::Testbed(ETestbedMode mode) {
 	}
 
 	m_devices.emplace_back(active_device, true);
-
+	
 	// Multi-GPU is only supported in NeRF mode for now
 	int n_devices = cuda_device_count();
 	for (int i = 0; i < n_devices; ++i) {
 		if (i == active_device) {
 			continue;
 		}
-
 		if (cuda_compute_capability(i) >= MIN_GPU_ARCH) {
+			
 			m_devices.emplace_back(i, false);
 		}
 	}
@@ -4261,18 +4261,57 @@ void Testbed::render_frame(
 	bool to_srgb,
 	CudaDevice* device
 ) {
+
 	if (!device) {
 		device = &primary_device();
 	}
 
 	sync_device(render_buffer, *device);
 
+	std::vector<ScopeGuard> device_guards;
+
 	{
 		auto device_guard = use_device(stream, render_buffer, *device);
+
 		render_frame_main(*device, camera_matrix0, camera_matrix1, orig_screen_center, relative_focal_length, nerf_rolling_shutter, foveation, visualized_dimension);
 	}
 
 	render_frame_epilogue(stream, camera_matrix0, prev_camera_matrix, orig_screen_center, relative_focal_length, foveation, prev_foveation, render_buffer, to_srgb);
+}
+
+void Testbed::render_frame_multi_devices(
+	const mat4x3& camera_matrix0,
+	const mat4x3& camera_matrix1,
+	const mat4x3& prev_camera_matrix,
+	const vec2& orig_screen_center,
+	const vec2& relative_focal_length,
+	const vec4& nerf_rolling_shutter,
+	const Foveation& foveation,
+	const Foveation& prev_foveation,
+	int visualized_dimension,
+	std::vector<CudaRenderBuffer>& render_buffer,
+	bool to_srgb,
+	CudaDevice* device
+) {
+
+	for(int i = 0;i< m_devices.size();i++){
+		
+		sync_device(render_buffer[i], m_devices[i]);
+	}
+	
+	std::vector<ScopeGuard> guards;
+	{
+		for (int i = 0;i< m_devices.size();i++){
+			auto device_guard = use_device(m_devices[i].stream(), render_buffer[i], m_devices[i]);
+			guards.emplace_back(std::move(device_guard));
+		}
+		render_frame_main_multi_devices(m_devices, camera_matrix0, camera_matrix1, orig_screen_center, relative_focal_length, nerf_rolling_shutter, foveation, visualized_dimension);
+	}
+	cudaSetDevice(0);
+	
+
+	render_frame_epilogue(m_devices[0].stream(), camera_matrix0, prev_camera_matrix, orig_screen_center, relative_focal_length, foveation, prev_foveation, render_buffer[0], to_srgb);
+	guards.clear();
 }
 
 void Testbed::render_frame_main(
@@ -4285,15 +4324,19 @@ void Testbed::render_frame_main(
 	const Foveation& foveation,
 	int visualized_dimension
 ) {
-	device.render_buffer_view().clear(device.stream());
+	// device.render_buffer_view().clear(device.stream());
 
 	if (!m_network) {
 		return;
 	}
 
+	std::cout << "focal_length: " << device.render_buffer_view().resolution.x << " screen_center: " << device.render_buffer_view().resolution.y <<std::endl;
+	std::cout << "focal_length: " << m_devices[0].render_buffer_view().resolution.x << " screen_center: " << m_devices[0].render_buffer_view().resolution.y <<std::endl;
+
 	vec2 focal_length = calc_focal_length(device.render_buffer_view().resolution, relative_focal_length, m_fov_axis, m_zoom);
 	vec2 screen_center = render_screen_center(orig_screen_center);
 
+	
 	switch (m_testbed_mode) {
 		case ETestbedMode::Nerf:
 			if (!m_render_ground_truth || m_ground_truth_alpha < 1.0f) {
@@ -4390,6 +4433,42 @@ void Testbed::render_frame_main(
 	}
 }
 
+void Testbed::render_frame_main_multi_devices(
+	std::vector<CudaDevice>& devices,
+	const mat4x3& camera_matrix0,
+	const mat4x3& camera_matrix1,
+	const vec2& orig_screen_center,
+	const vec2& relative_focal_length,
+	const vec4& nerf_rolling_shutter,
+	const Foveation& foveation,
+	int visualized_dimension
+) {
+	for (const auto& device : devices) {
+		device.render_buffer_view().clear(device.stream());
+	}
+
+	if (!m_network) {
+		return;
+	}
+	// 计算焦距和屏幕中心位置
+	vec2 focal_length = calc_focal_length(devices[0].render_buffer_view().resolution, relative_focal_length, m_fov_axis, m_zoom);
+	vec2 screen_center = render_screen_center(orig_screen_center);
+
+	switch (m_testbed_mode) {
+		// 计算焦距和屏幕中心位置
+		case ETestbedMode::Nerf:
+			if (!m_render_ground_truth || m_ground_truth_alpha < 1.0f) {
+				render_nerf_multi_device(devices, focal_length, camera_matrix0, camera_matrix1, nerf_rolling_shutter, screen_center, foveation, visualized_dimension);
+			}
+			break;
+		default:
+			// No-op if no mode is active
+			break;
+	}
+}
+
+
+
 void Testbed::render_frame_epilogue(
 	cudaStream_t stream,
 	const mat4x3& camera_matrix0,
@@ -4408,7 +4487,6 @@ void Testbed::render_frame_epilogue(
 	render_buffer.set_tonemap_curve(m_tonemap_curve);
 
 	Lens lens = (m_testbed_mode == ETestbedMode::Nerf && m_nerf.render_with_lens_distortion) ? m_nerf.render_lens : Lens{};
-
 	// Prepare DLSS data: motion vectors, scaled depth, exposure
 	if (render_buffer.dlss()) {
 		auto res = render_buffer.in_resolution();
@@ -4465,7 +4543,6 @@ void Testbed::render_frame_epilogue(
 			render_buffer.frame_buffer()
 		);
 	}
-
 	render_buffer.accumulate(m_exposure, stream);
 	render_buffer.tonemap(m_exposure, m_background_color, output_color_space, m_ndc_znear, m_ndc_zfar, m_snap_to_pixel_centers, stream);
 
@@ -4896,8 +4973,8 @@ auto make_copyable_function(F&& f) {
 }
 
 ScopeGuard Testbed::use_device(cudaStream_t stream, CudaRenderBuffer& render_buffer, Testbed::CudaDevice& device) {
-	device.wait_for(stream);
 
+	// device.wait_for(stream);
 	if (device.is_primary()) {
 		device.set_render_buffer_view(render_buffer.view());
 		return ScopeGuard{[&device, stream]() {
@@ -4905,12 +4982,12 @@ ScopeGuard Testbed::use_device(cudaStream_t stream, CudaRenderBuffer& render_buf
 			device.signal(stream);
 		}};
 	}
-
+	
 	int active_device = cuda_device();
 	auto guard = device.device_guard();
 
 	size_t n_pixels = compMul(render_buffer.in_resolution());
-
+	
 	GPUMemoryArena::Allocation alloc;
 	auto scratch = allocate_workspace_and_distribute<vec4, float>(device.stream(), &alloc, n_pixels, n_pixels);
 

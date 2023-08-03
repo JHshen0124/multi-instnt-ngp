@@ -36,6 +36,8 @@
 #include <filesystem/directory.h>
 #include <filesystem/path.h>
 
+#include <omp.h>
+
 
 #ifdef copysign
 #undef copysign
@@ -778,7 +780,6 @@ __global__ void advance_pos_nerf_kernel(
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
-
 	advance_pos_nerf(payloads[i], render_aabb, render_aabb_to_local, camera_fwd, focal_length, sample_index, density_grid, min_mip, max_mip, cone_angle_constant);
 }
 
@@ -894,6 +895,7 @@ __global__ void composite_kernel_nerf(
 	float min_transmittance
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	
 	if (i >= n_elements) return;
 
 	NerfPayload& payload = payloads[i];
@@ -1829,14 +1831,13 @@ __global__ void shade_kernel_nerf(
 	NerfPayload& payload = payloads[i];
 
 	vec4 tmp = rgba[i];
-	if (render_mode == ERenderMode::Normals) {
+	if (render_mode == ERenderMode::Normals) {	
 		vec3 n = normalize(tmp.xyz());
 		tmp.rgb = (0.5f * n + vec3(0.5f)) * tmp.a;
 	} else if (render_mode == ERenderMode::Cost) {
 		float col = (float)payload.n_steps / 128;
 		tmp = {col, col, col, 1.0f};
 	}
-
 	if (!train_in_linear_colors && (render_mode == ERenderMode::Shade || render_mode == ERenderMode::Slice)) {
 		// Accumulate in linear colors
 		tmp.rgb = srgb_to_linear(tmp.rgb);
@@ -1857,9 +1858,8 @@ __global__ void compact_kernel_nerf(
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= n_elements) return;
-
 	NerfPayload& src_payload = src_payloads[i];
-
+	
 	if (src_payload.alive) {
 		uint32_t idx = atomicAdd(counter, 1);
 		dst_payloads[idx] = src_payload;
@@ -1871,6 +1871,188 @@ __global__ void compact_kernel_nerf(
 		dst_final_rgba[idx] = src_rgba[i];
 		dst_final_depth[idx] = src_depth[i];
 	}
+}
+
+__global__ void init_rays_with_payload_kernel_nerf_multi_devices(
+	uint32_t sample_index,
+	NerfPayload* __restrict__ payloads,
+	ivec2 resolution,
+	vec2 focal_length,
+	mat4x3 camera_matrix0,
+	mat4x3 camera_matrix1,
+	vec4 rolling_shutter,
+	vec2 screen_center,
+	vec3 parallax_shift,
+	bool snap_to_pixel_centers,
+	BoundingBox render_aabb,
+	mat3 render_aabb_to_local,
+	float near_distance,
+	float plane_z,
+	float aperture_size,
+	Foveation foveation,
+	Lens lens,
+	Buffer2DView<const vec4> envmap,
+	vec4* __restrict__ frame_buffer,
+	float* __restrict__ depth_buffer,
+	Buffer2DView<const uint8_t> hidden_area_mask,
+	Buffer2DView<const vec2> distortion,
+	ERenderMode render_mode,
+	int y_offset,
+	int y_stride,
+	Ray &ray,
+	vec3 &origin1,
+	vec3 &dir1
+
+) {
+	uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
+	uint32_t y = threadIdx.y + blockDim.y * blockIdx.y + y_offset;
+	
+	if (x >= resolution.x || y >= y_offset + y_stride) {
+		return;
+	}
+
+	uint32_t idx = x + resolution.x * (y);
+
+	if (plane_z < 0) {
+		aperture_size = 0.0;
+	}
+
+	vec2 pixel_offset = ld_random_pixel_offset(snap_to_pixel_centers ? 0 : sample_index);
+	vec2 uv = vec2{(float)x + pixel_offset.x, (float)y + pixel_offset.y} / vec2(resolution);
+	float ray_time = rolling_shutter.x + rolling_shutter.y * uv.x + rolling_shutter.z * uv.y + rolling_shutter.w * ld_random_val(sample_index, idx * 72239731);
+	// ray = uv_to_ray(
+	// 	sample_index,
+	// 	uv,
+	// 	resolution,
+	// 	focal_length,
+	// 	camera_matrix0 * ray_time + camera_matrix1 * (1.f - ray_time),
+	// 	screen_center,
+	// 	parallax_shift,
+	// 	near_distance,
+	// 	plane_z,
+	// 	aperture_size,
+	// 	foveation,
+	// 	hidden_area_mask,
+	// 	lens,
+	// 	distortion
+	// );
+	
+	bool ray_valid = true;
+		mat4x3 camera_matrix = camera_matrix0 * ray_time + camera_matrix1 * (1.f - ray_time);
+		vec2 warped_uv = foveation.warp(uv);
+
+		// // Check the hidden area mask _after_ applying foveation, because foveation will be undone
+		// // before blitting to the framebuffer to which the hidden area mask corresponds.
+		if (hidden_area_mask && !hidden_area_mask.at(warped_uv)) {
+			ray_valid = false;
+		}
+
+		vec3 dir;
+		if (lens.mode == ELensMode::FTheta) {
+			dir = f_theta_undistortion(warped_uv - screen_center, lens.params, {0.f, 0.f, 0.f});
+			if (dir == vec3(0.0f)) {
+				ray_valid = false;
+			}
+		} else if (lens.mode == ELensMode::LatLong) {
+			dir = latlong_to_dir(warped_uv);
+		} else if (lens.mode == ELensMode::Equirectangular) {
+			dir = equirectangular_to_dir(warped_uv);
+		} else {
+			dir = {
+				(warped_uv.x - screen_center.x) * (float)resolution.x / focal_length.x,
+				(warped_uv.y - screen_center.y) * (float)resolution.y / focal_length.y,
+				1.0f
+			};
+
+			if (lens.mode == ELensMode::OpenCV) {
+				iterative_opencv_lens_undistortion(lens.params, &dir.x, &dir.y);
+			} else if (lens.mode == ELensMode::OpenCVFisheye) {
+				iterative_opencv_fisheye_lens_undistortion(lens.params, &dir.x, &dir.y);
+			}
+		}
+
+		if (distortion) {
+			dir.xy += distortion.at_lerp(warped_uv);
+		}
+
+		vec3 head_pos = {parallax_shift.x, parallax_shift.y, 0.f};
+		dir -= head_pos * parallax_shift.z; // we could use focus_z here in the denominator. for now, we pack m_scale in here.
+		dir = mat3(camera_matrix) * dir;
+
+		vec3 origin = mat3(camera_matrix) * head_pos + camera_matrix[3];
+		origin = mat3(camera_matrix) * head_pos + camera_matrix[3];
+		if (aperture_size != 0.0f) {
+			vec3 lookat = origin + dir * plane_z;
+			auto px = ivec2(uv * vec2(resolution));
+			vec2 blur = aperture_size * square2disk_shirley(ld_random_val_2d(sample_index, px.x * 19349663 + px.y * 96925573) * 2.0f - vec2(1.0f));
+			origin += mat2x3(camera_matrix) * blur;
+			dir = (lookat - origin) / plane_z;
+		}
+
+		origin += dir * near_distance;
+
+
+	// vec3 origin = {1.0f, 2.0f, 3.0f};
+	// vec3 dir = {1.0f, 2.0f, 3.0f};
+	NerfPayload& payload = payloads[idx];
+	payload.max_weight = 0.0f;
+	payload.alive = false;
+	payload.t = 0.01;
+
+	depth_buffer[idx] = MAX_DEPTH();
+
+	if (!ray_valid) {
+		payload.origin = origin;
+		payload.alive = false;
+		return;
+	}
+
+	if (plane_z < 0) {
+		float n = length(dir);
+		payload.origin = origin;
+		payload.dir = (1.0f/n) * dir;
+		payload.t = -plane_z*n;
+		payload.idx = idx;
+		payload.n_steps = 0;
+		payload.alive = false;
+		depth_buffer[idx] = -plane_z;
+		return;
+	}
+
+	dir = normalize(dir);
+
+	if (envmap) {
+		frame_buffer[idx] = read_envmap(envmap, dir);
+	}
+
+	float t = fmaxf(render_aabb.ray_intersect(render_aabb_to_local * origin, render_aabb_to_local * dir).x, 0.0f) + 1e-6f;
+
+	if (!render_aabb.contains(render_aabb_to_local * (origin + t * dir))) {
+		payload.origin = origin;
+		payload.alive = false;
+		return;
+	}
+
+	if (render_mode == ERenderMode::Distortion) {
+		vec2 offset = vec2(0.0f);
+		if (distortion) {
+			offset += distortion.at_lerp(vec2{(float)x + 0.5f, (float)y + 0.5f} / vec2(resolution));
+		}
+
+		frame_buffer[idx].rgb() = to_rgb(offset * 50.0f);
+		frame_buffer[idx].a = 1.0f;
+		depth_buffer[idx] = 1.0f;
+		payload.origin = origin + MAX_DEPTH() * dir;
+		payload.alive = false;
+		return;
+	}
+	
+	payload.origin = origin;
+	payload.dir = dir;
+	payload.t = t;
+	payload.idx = idx;
+	payload.n_steps = 0;
+	payload.alive = true;
 }
 
 __global__ void init_rays_with_payload_kernel_nerf(
@@ -2055,6 +2237,105 @@ __global__ void safe_divide(const uint32_t num_elements, float* __restrict__ ino
 	inout[i] = local_divisor > 0.0f ? (inout[i] / local_divisor) : 0.0f;
 }
 
+void Testbed::NerfTracer::init_rays_from_camera_multi_devices(
+	uint32_t sample_index,
+	uint32_t padded_output_width,
+	uint32_t n_extra_dims,
+	const ivec2& resolution,
+	const vec2& focal_length,
+	const mat4x3& camera_matrix0,
+	const mat4x3& camera_matrix1,
+	const vec4& rolling_shutter,
+	const vec2& screen_center,
+	const vec3& parallax_shift,
+	bool snap_to_pixel_centers,
+	const BoundingBox& render_aabb,
+	const mat3& render_aabb_to_local,
+	float near_distance,
+	float plane_z,
+	float aperture_size,
+	const Foveation& foveation,
+	const Lens& lens,
+	const Buffer2DView<const vec4>& envmap,
+	const Buffer2DView<const vec2>& distortion,
+	vec4* frame_buffer,
+	float* depth_buffer,
+	const Buffer2DView<const uint8_t>& hidden_area_mask,
+	const uint8_t* grid,
+	int show_accel,
+	uint32_t max_mip,
+	float cone_angle_constant,
+	int n_pixels,
+	int y_offset,
+	int y_stride,
+	ERenderMode render_mode,
+	RaysNerfSoa *m_rays,
+	RaysNerfSoa &m_rays_hit,
+	cudaStream_t stream
+) {
+	// Make sure we have enough memory reserved to render at the requested resolution
+	enlarge_multi_devices(n_pixels, padded_output_width, n_extra_dims, m_rays,m_rays_hit,stream);
+	const dim3 threads = { 16, 8, 1 };
+	const dim3 blocks = { div_round_up((uint32_t)resolution.x, threads.x), div_round_up((uint32_t)y_stride, threads.y), 1 };
+	int device_id;
+	cudaGetDevice(&device_id);
+
+	Ray *ray;
+	cudaMalloc(&ray, sizeof(Ray));
+	vec3 *camera_matrix;
+	cudaMalloc(&camera_matrix, sizeof(vec3));
+	vec3 *warped_uv;
+	cudaMalloc(&warped_uv, sizeof(vec3));
+	
+	init_rays_with_payload_kernel_nerf_multi_devices<<<blocks, threads, 0, stream>>>(
+		sample_index,
+		m_rays[0].payload,
+		resolution,
+		focal_length,
+		camera_matrix0,
+		camera_matrix1,
+		rolling_shutter,
+		screen_center,
+		parallax_shift,
+		snap_to_pixel_centers,
+		render_aabb,
+		render_aabb_to_local,
+		near_distance,
+		plane_z,
+		aperture_size,
+		foveation,
+		lens,
+		envmap,
+		frame_buffer,
+		depth_buffer,
+		hidden_area_mask,
+		distortion,
+		render_mode,
+		y_offset,
+		y_stride,
+		*ray,
+		*camera_matrix,
+		*warped_uv
+	);
+	m_n_rays_initialized = resolution.x * y_stride;
+
+	CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].rgba, 0, m_n_rays_initialized * sizeof(vec4), stream));
+	CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].depth, 0, m_n_rays_initialized * sizeof(float), stream));
+	linear_kernel(advance_pos_nerf_kernel, 0, stream,
+		m_n_rays_initialized,
+		render_aabb,
+		render_aabb_to_local,
+		camera_matrix1[2],
+		focal_length,
+		sample_index,
+		m_rays[0].payload,
+		grid,
+		(show_accel >= 0) ? show_accel : 0,
+		max_mip,
+		cone_angle_constant
+	);
+}
+
 void Testbed::NerfTracer::init_rays_from_camera(
 	uint32_t sample_index,
 	uint32_t padded_output_width,
@@ -2138,7 +2419,7 @@ void Testbed::NerfTracer::init_rays_from_camera(
 	);
 }
 
-uint32_t Testbed::NerfTracer::trace(
+uint32_t Testbed::NerfTracer::trace_multi_devices(
 	NerfNetwork<network_precision_t>& network,
 	const BoundingBox& render_aabb,
 	const mat3& render_aabb_to_local,
@@ -2159,12 +2440,13 @@ uint32_t Testbed::NerfTracer::trace(
 	float glow_y_cutoff,
 	int glow_mode,
 	const float* extra_dims_gpu,
+	RaysNerfSoa *m_rays,
+	RaysNerfSoa &m_rays_hit,
 	cudaStream_t stream
 ) {
 	if (m_n_rays_initialized == 0) {
 		return 0;
 	}
-
 	CUDA_CHECK_THROW(cudaMemsetAsync(m_hit_counter, 0, sizeof(uint32_t), stream));
 
 	uint32_t n_alive = m_n_rays_initialized;
@@ -2172,14 +2454,15 @@ uint32_t Testbed::NerfTracer::trace(
 
 	uint32_t i = 1;
 	uint32_t double_buffer_index = 0;
+	
 	while (i < MARCH_ITER) {
 		RaysNerfSoa& rays_current = m_rays[(double_buffer_index + 1) % 2];
 		RaysNerfSoa& rays_tmp = m_rays[double_buffer_index % 2];
 		++double_buffer_index;
-
 		// Compact rays that did not diverge yet
-		{
+		{	
 			CUDA_CHECK_THROW(cudaMemsetAsync(m_alive_counter, 0, sizeof(uint32_t), stream));
+			NerfPayload& src_payload = rays_tmp.payload[i];
 			linear_kernel(compact_kernel_nerf, 0, stream,
 				n_alive,
 				rays_tmp.rgba, rays_tmp.depth, rays_tmp.payload,
@@ -2187,18 +2470,17 @@ uint32_t Testbed::NerfTracer::trace(
 				m_rays_hit.rgba, m_rays_hit.depth, m_rays_hit.payload,
 				m_alive_counter, m_hit_counter
 			);
+			
 			CUDA_CHECK_THROW(cudaMemcpyAsync(&n_alive, m_alive_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
 			CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
 		}
-
+		std::cout << "n_alive: " << n_alive << std::endl;
 		if (n_alive == 0) {
 			break;
 		}
-
 		// Want a large number of queries to saturate the GPU and to ensure compaction doesn't happen toooo frequently.
 		uint32_t target_n_queries = 2 * 1024 * 1024;
 		uint32_t n_steps_between_compaction = tcnn::clamp(target_n_queries / n_alive, (uint32_t)MIN_STEPS_INBETWEEN_COMPACTION, (uint32_t)MAX_STEPS_INBETWEEN_COMPACTION);
-
 		uint32_t extra_stride = network.n_extra_dims() * sizeof(float);
 		PitchedPtr<NerfCoordinate> input_data((NerfCoordinate*)m_network_input, 1, 0, extra_stride);
 		linear_kernel(generate_next_nerf_network_inputs, 0, stream,
@@ -2262,6 +2544,131 @@ uint32_t Testbed::NerfTracer::trace(
 	return n_hit;
 }
 
+uint32_t Testbed::NerfTracer::trace(
+	NerfNetwork<network_precision_t>& network,
+	const BoundingBox& render_aabb,
+	const mat3& render_aabb_to_local,
+	const BoundingBox& train_aabb,
+	const vec2& focal_length,
+	float cone_angle_constant,
+	const uint8_t* grid,
+	ERenderMode render_mode,
+	const mat4x3 &camera_matrix,
+	float depth_scale,
+	int visualized_layer,
+	int visualized_dim,
+	ENerfActivation rgb_activation,
+	ENerfActivation density_activation,
+	int show_accel,
+	uint32_t max_mip,
+	float min_transmittance,
+	float glow_y_cutoff,
+	int glow_mode,
+	const float* extra_dims_gpu,
+	cudaStream_t stream
+) {
+	if (m_n_rays_initialized == 0) {
+		return 0;
+	}
+
+	CUDA_CHECK_THROW(cudaMemsetAsync(m_hit_counter, 0, sizeof(uint32_t), stream));
+
+	uint32_t n_alive = m_n_rays_initialized;
+	// m_n_rays_initialized = 0;
+	uint32_t i = 1;
+	uint32_t double_buffer_index = 0;
+	while (i < MARCH_ITER) {
+		RaysNerfSoa& rays_current = m_rays[(double_buffer_index + 1) % 2];
+		RaysNerfSoa& rays_tmp = m_rays[double_buffer_index % 2];
+		++double_buffer_index;
+
+		// Compact rays that did not diverge yet
+		{
+			CUDA_CHECK_THROW(cudaMemsetAsync(m_alive_counter, 0, sizeof(uint32_t), stream));
+			std::cout << 222 << std::endl;
+			linear_kernel(compact_kernel_nerf, 0, stream,
+				n_alive,
+				rays_tmp.rgba, rays_tmp.depth, rays_tmp.payload,
+				rays_current.rgba, rays_current.depth, rays_current.payload,
+				m_rays_hit.rgba, m_rays_hit.depth, m_rays_hit.payload,
+				m_alive_counter, m_hit_counter
+			);
+			CUDA_CHECK_THROW(cudaMemcpyAsync(&n_alive, m_alive_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+			CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+			std::cout << 444 << std::endl;
+		}
+
+		if (n_alive == 0) {
+			break;
+		}
+		
+		// Want a large number of queries to saturate the GPU and to ensure compaction doesn't happen toooo frequently.
+		uint32_t target_n_queries = 2 * 1024 * 1024;
+		uint32_t n_steps_between_compaction = tcnn::clamp(target_n_queries / n_alive, (uint32_t)MIN_STEPS_INBETWEEN_COMPACTION, (uint32_t)MAX_STEPS_INBETWEEN_COMPACTION);
+
+		uint32_t extra_stride = network.n_extra_dims() * sizeof(float);
+		PitchedPtr<NerfCoordinate> input_data((NerfCoordinate*)m_network_input, 1, 0, extra_stride);
+		std::cout << 555 << std::endl;
+		linear_kernel(generate_next_nerf_network_inputs, 0, stream,
+			n_alive,
+			render_aabb,
+			render_aabb_to_local,
+			train_aabb,
+			focal_length,
+			camera_matrix[2],
+			rays_current.payload,
+			input_data,
+			n_steps_between_compaction,
+			grid,
+			(show_accel>=0) ? show_accel : 0,
+			max_mip,
+			cone_angle_constant,
+			extra_dims_gpu
+		);
+		uint32_t n_elements = next_multiple(n_alive * n_steps_between_compaction, tcnn::batch_size_granularity);
+		GPUMatrix<float> positions_matrix((float*)m_network_input, (sizeof(NerfCoordinate) + extra_stride) / sizeof(float), n_elements);
+		GPUMatrix<network_precision_t, RM> rgbsigma_matrix((network_precision_t*)m_network_output, network.padded_output_width(), n_elements);
+		network.inference_mixed_precision(stream, positions_matrix, rgbsigma_matrix);
+		std::cout << 666 << std::endl;
+		if (render_mode == ERenderMode::Normals) {
+			network.input_gradient(stream, 3, positions_matrix, positions_matrix);
+		} else if (render_mode == ERenderMode::EncodingVis) {
+			network.visualize_activation(stream, visualized_layer, visualized_dim, positions_matrix, positions_matrix);
+		}
+
+		linear_kernel(composite_kernel_nerf, 0, stream,
+			n_alive,
+			n_elements,
+			i,
+			train_aabb,
+			glow_y_cutoff,
+			glow_mode,
+			camera_matrix,
+			focal_length,
+			depth_scale,
+			rays_current.rgba,
+			rays_current.depth,
+			rays_current.payload,
+			input_data,
+			m_network_output,
+			network.padded_output_width(),
+			n_steps_between_compaction,
+			render_mode,
+			grid,
+			rgb_activation,
+			density_activation,
+			show_accel,
+			min_transmittance
+		);
+
+		i += n_steps_between_compaction;
+	}
+	uint32_t n_hit;
+	CUDA_CHECK_THROW(cudaMemcpyAsync(&n_hit, m_hit_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+	CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+	return n_hit;
+}
+
 void Testbed::NerfTracer::enlarge(size_t n_elements, uint32_t padded_output_width, uint32_t n_extra_dims, cudaStream_t stream) {
 	n_elements = next_multiple(n_elements, size_t(tcnn::batch_size_granularity));
 	size_t num_floats = sizeof(NerfCoordinate) / 4 + n_extra_dims;
@@ -2289,6 +2696,38 @@ void Testbed::NerfTracer::enlarge(size_t n_elements, uint32_t padded_output_widt
 	m_rays[1].set(std::get<3>(scratch), std::get<4>(scratch), std::get<5>(scratch), n_elements);
 	m_rays_hit.set(std::get<6>(scratch), std::get<7>(scratch), std::get<8>(scratch), n_elements);
 
+	m_network_output = std::get<9>(scratch);
+	m_network_input = std::get<10>(scratch);
+
+	m_hit_counter = std::get<11>(scratch);
+	m_alive_counter = std::get<12>(scratch);
+}
+
+void Testbed::NerfTracer::enlarge_multi_devices(size_t n_elements, uint32_t padded_output_width, uint32_t n_extra_dims, RaysNerfSoa* m_rays,RaysNerfSoa &m_rays_hit,cudaStream_t stream) {
+	n_elements = next_multiple(n_elements, size_t(tcnn::batch_size_granularity));
+	size_t num_floats = sizeof(NerfCoordinate) / 4 + n_extra_dims;
+	auto scratch = allocate_workspace_and_distribute<
+		vec4, float, NerfPayload, // m_rays[0]
+		vec4, float, NerfPayload, // m_rays[1]
+		vec4, float, NerfPayload, // m_rays_hit
+
+		network_precision_t,
+		float,
+		uint32_t,
+		uint32_t
+	>(
+		stream, &m_scratch_alloc,
+		n_elements, n_elements, n_elements,
+		n_elements, n_elements, n_elements,
+		n_elements, n_elements, n_elements,
+		n_elements * MAX_STEPS_INBETWEEN_COMPACTION * padded_output_width,
+		n_elements * MAX_STEPS_INBETWEEN_COMPACTION * num_floats,
+		32, // 2 full cache lines to ensure no overlap
+		32  // 2 full cache lines to ensure no overlap
+	);
+	m_rays[0].set(std::get<0>(scratch), std::get<1>(scratch), std::get<2>(scratch), n_elements);
+	m_rays[1].set(std::get<3>(scratch), std::get<4>(scratch), std::get<5>(scratch), n_elements);
+	m_rays_hit.set(std::get<6>(scratch), std::get<7>(scratch), std::get<8>(scratch), n_elements);
 	m_network_output = std::get<9>(scratch);
 	m_network_input = std::get<10>(scratch);
 
@@ -2348,6 +2787,241 @@ const float* Testbed::get_inference_extra_dims(cudaStream_t stream) const {
 	vec3 light_dir = warp_direction(normalize(m_nerf.light_dir));
 	CUDA_CHECK_THROW(cudaMemcpyAsync(dims_gpu, &light_dir, min(size, sizeof(vec3)), cudaMemcpyHostToDevice, stream));
 	return dims_gpu;
+}
+
+// void render_nerf_multi_device_thread(
+// 	std::vector<Testbed::CudaDevice>& devices,
+// 	const vec2& focal_length,
+//     const mat4x3& camera_matrix0,
+//     const mat4x3& camera_matrix1,
+//     const vec4& rolling_shutter,
+//     const vec2& screen_center,
+//     const Foveation& foveation,
+//     int visualized_dimension,
+// 	int device_id,
+// 	int y_stride
+// ){
+// 	int i = device_id;
+// 	cudaSetDevice(i);
+//         cudaStream_t stream = devices[i].stream();
+//         const CudaRenderBufferView& render_buffer = devices[i].render_buffer_view();
+// 		auto density_grid_bitfield = devices[i].data().density_grid_bitfield_ptr;
+// 		int y_offset = i * y_stride;
+// 		int num_rays = y_stride * render_buffer.resolution.x;
+// 		RaysNerfSoa m_rays[2];
+// 		RaysNerfSoa m_rays_hit;
+
+// 		auto nerf_network = *devices[i].nerf_network();
+//         // Initialize the rays for this device
+//         Testbed::NerfTracer tracer;
+//         tracer.init_rays_from_camera_multi_devices(
+//             render_buffer.spp,
+//             nerf_network.padded_output_width(),
+//             nerf_network.n_extra_dims(),
+//             render_buffer.resolution,
+//             focal_length,
+//             camera_matrix0,
+//             camera_matrix1,
+//             rolling_shutter,
+//             screen_center,
+//             m_parallax_shift,
+//             m_snap_to_pixel_centers,
+//             m_render_aabb,
+//             m_render_aabb_to_local,
+//             m_render_near_distance,
+//             m_slice_plane_z + m_scale,
+//             m_aperture_size,
+//             foveation,
+//             m_nerf.render_with_lens_distortion ? m_nerf.render_lens : Lens{},
+//             m_envmap.inference_view(),
+//             m_nerf.render_with_lens_distortion && m_dlss ? m_distortion.inference_view() : Buffer2DView<const vec2>{},
+//             render_buffer.frame_buffer,
+//             render_buffer.depth_buffer,
+//             render_buffer.hidden_area_mask ? render_buffer.hidden_area_mask->const_view() : Buffer2DView<const uint8_t>{},
+//             density_grid_bitfield,
+//             m_nerf.show_accel,
+//             m_nerf.max_cascade,
+//             m_nerf.cone_angle_constant,
+// 			num_rays,
+// 			y_offset,
+// 			y_stride,
+//             m_render_mode,
+// 			m_rays,
+// 			m_rays_hit,
+//             stream
+//         );
+//         // Trace the rays for this device
+//         uint32_t n_hits = 0;
+//         if (m_render_mode != ERenderMode::Slice) {
+//             float depth_scale = 1.0f / m_nerf.training.dataset.scale;
+//             n_hits = tracer.trace_multi_devices(
+//                 nerf_network,
+//                 m_render_aabb,
+//                 m_render_aabb_to_local,
+//                 m_aabb,
+//                 focal_length,
+//                 m_nerf.cone_angle_constant,
+//                 density_grid_bitfield,
+//                 m_render_mode,
+//                 camera_matrix1,
+//                 depth_scale,
+//                 m_visualized_layer,
+//                 visualized_dimension,
+//                 m_nerf.rgb_activation,
+//                 m_nerf.density_activation,
+//                 m_nerf.show_accel,
+//                 m_nerf.max_cascade,
+//                 m_nerf.render_min_transmittance,
+//                 m_nerf.glow_y_cutoff,
+//                 m_nerf.glow_mode,
+//                 get_inference_extra_dims(stream),
+// 				m_rays,
+// 				m_rays_hit,
+// 				stream
+//             );
+//         }
+// 		RaysNerfSoa& rays_hit = m_render_mode == ERenderMode::Slice ? tracer.rays_init() :m_rays_hit;
+// 		linear_kernel(shade_kernel_nerf, 0, stream,
+// 			n_hits,
+// 			rays_hit.rgba,
+// 			rays_hit.depth,
+// 			rays_hit.payload,
+// 			m_render_mode,
+// 			m_nerf.training.linear_colors,
+// 			render_buffer.frame_buffer,
+// 			render_buffer.depth_buffer
+// 		);
+// }
+
+
+void Testbed::render_nerf_multi_device(
+	std::vector<CudaDevice>& devices,
+    const vec2& focal_length,
+    const mat4x3& camera_matrix0,
+    const mat4x3& camera_matrix1,
+    const vec4& rolling_shutter,
+    const vec2& screen_center,
+    const Foveation& foveation,
+    int visualized_dimension
+) {
+
+	auto render_buffer = devices[0].render_buffer_view();
+    int n_devices = static_cast<int>(devices.size());
+    int total_num_rays = render_buffer.resolution.x * render_buffer.resolution.y;
+    int y_stride = (render_buffer.resolution.y + n_devices - 1) / n_devices; // Round up to ensure all rays are processed
+    // Loop over the devices and render the rays assigned to each device
+	//use openmp to parallel
+	#pragma omp parallel for
+    for (int i = 0; i < n_devices; ++i) {
+		cudaSetDevice(i);
+        cudaStream_t stream = devices[i].stream();
+        const CudaRenderBufferView& render_buffer = devices[i].render_buffer_view();
+		auto density_grid_bitfield = devices[i].data().density_grid_bitfield_ptr;
+		int y_offset = i * y_stride;
+		int num_rays = y_stride * render_buffer.resolution.x;
+		RaysNerfSoa m_rays[2];
+		RaysNerfSoa m_rays_hit;
+
+		auto nerf_network = *devices[i].nerf_network();
+        // Initialize the rays for this device
+        NerfTracer tracer;
+        tracer.init_rays_from_camera_multi_devices(
+            render_buffer.spp,
+            nerf_network.padded_output_width(),
+            nerf_network.n_extra_dims(),
+            render_buffer.resolution,
+            focal_length,
+            camera_matrix0,
+            camera_matrix1,
+            rolling_shutter,
+            screen_center,
+            m_parallax_shift,
+            m_snap_to_pixel_centers,
+            m_render_aabb,
+            m_render_aabb_to_local,
+            m_render_near_distance,
+            m_slice_plane_z + m_scale,
+            m_aperture_size,
+            foveation,
+            m_nerf.render_with_lens_distortion ? m_nerf.render_lens : Lens{},
+            m_envmap.inference_view(),
+            m_nerf.render_with_lens_distortion && m_dlss ? m_distortion.inference_view() : Buffer2DView<const vec2>{},
+            render_buffer.frame_buffer,
+            render_buffer.depth_buffer,
+            render_buffer.hidden_area_mask ? render_buffer.hidden_area_mask->const_view() : Buffer2DView<const uint8_t>{},
+            density_grid_bitfield,
+            m_nerf.show_accel,
+            m_nerf.max_cascade,
+            m_nerf.cone_angle_constant,
+			num_rays,
+			y_offset,
+			y_stride,
+            m_render_mode,
+			m_rays,
+			m_rays_hit,
+            stream
+        );
+        // Trace the rays for this device
+        uint32_t n_hits = 0;
+        if (m_render_mode != ERenderMode::Slice) {
+            float depth_scale = 1.0f / m_nerf.training.dataset.scale;
+            n_hits = tracer.trace_multi_devices(
+                nerf_network,
+                m_render_aabb,
+                m_render_aabb_to_local,
+                m_aabb,
+                focal_length,
+                m_nerf.cone_angle_constant,
+                density_grid_bitfield,
+                m_render_mode,
+                camera_matrix1,
+                depth_scale,
+                m_visualized_layer,
+                visualized_dimension,
+                m_nerf.rgb_activation,
+                m_nerf.density_activation,
+                m_nerf.show_accel,
+                m_nerf.max_cascade,
+                m_nerf.render_min_transmittance,
+                m_nerf.glow_y_cutoff,
+                m_nerf.glow_mode,
+                get_inference_extra_dims(stream),
+				m_rays,
+				m_rays_hit,
+				stream
+            );
+        }
+		RaysNerfSoa& rays_hit = m_render_mode == ERenderMode::Slice ? tracer.rays_init() :m_rays_hit;
+		linear_kernel(shade_kernel_nerf, 0, stream,
+			n_hits,
+			rays_hit.rgba,
+			rays_hit.depth,
+			rays_hit.payload,
+			m_render_mode,
+			m_nerf.training.linear_colors,
+			render_buffer.frame_buffer,
+			render_buffer.depth_buffer
+		);
+	}
+	// for (int i = 0; i < n_devices; ++i) {
+	// 	std::thread t(render_nerf_multi_device_thread1);
+	// 	t.detach();
+	// }
+	cudaDeviceSynchronize();
+	// copy every render_buffer to the first device
+	for (int i = 1; i < n_devices; ++i) {
+		uint32_t offside = i * y_stride * render_buffer.resolution.x;
+		cudaMemcpyAsync(devices[0].render_buffer_view().frame_buffer + offside, devices[i].render_buffer_view().frame_buffer+ offside, y_stride * render_buffer.resolution.x * sizeof(vec4) , cudaMemcpyDeviceToDevice, devices[i].stream());
+		cudaMemcpyAsync(devices[0].render_buffer_view().depth_buffer + offside, devices[i].render_buffer_view().depth_buffer+ offside, y_stride * render_buffer.resolution.x * sizeof(float), cudaMemcpyDeviceToDevice, devices[i].stream());
+	}
+	
+    // Synchronize all streams before returning
+    cudaDeviceSynchronize();
+	float a=0,b=0,c=0;
+		cudaMemcpy(&a, devices[0].render_buffer_view().depth_buffer + 1036800, sizeof(float), cudaMemcpyDeviceToHost);
+		cudaMemcpy(&b, devices[0].render_buffer_view().depth_buffer +1036800+ 16500, sizeof(float), cudaMemcpyDeviceToHost);
+		cudaMemcpy(&c, devices[0].render_buffer_view().depth_buffer +1036800+ 16400, sizeof(float), cudaMemcpyDeviceToHost);
+		std::cout <<"a: " << a << " " << b << " " << c << std::endl;
 }
 
 void Testbed::render_nerf(
@@ -2442,7 +3116,7 @@ void Testbed::render_nerf(
 		);
 	}
 	RaysNerfSoa& rays_hit = m_render_mode == ERenderMode::Slice ? tracer.rays_init() : tracer.rays_hit();
-
+	
 	if (m_render_mode == ERenderMode::Slice) {
 		// Store colors in the normal buffer
 		uint32_t n_elements = next_multiple(n_hit, tcnn::batch_size_granularity);
