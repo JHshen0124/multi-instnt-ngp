@@ -237,12 +237,11 @@ if __name__ == "__main__":
 				testbed.set_camera_to_training_view(i)
 				ref_image = testbed.render(resolution[0], resolution[1], 1, True)
 				testbed.render_ground_truth = False
-				image = testbed.render(resolution[0], resolution[1], spp, True)
-
+				image = testbed.render(resolution[0], resolution[1], 8, True)
+				
 				if i == 0:
 					write_image(f"ref.png", ref_image)
 					write_image(f"out.png", image)
-
 					diffimg = np.absolute(image - ref_image)
 					diffimg[...,3:4] = 1.0
 					write_image("diff.png", diffimg)
@@ -276,6 +275,7 @@ if __name__ == "__main__":
 		if not args.screenshot_frames:
 			args.screenshot_frames = range(len(ref_transforms["frames"]))
 		print(args.screenshot_frames)
+		t1 = time.time()
 		for idx in args.screenshot_frames:
 			f = ref_transforms["frames"][int(idx)]
 			cam_matrix = f["transform_matrix"]
@@ -288,15 +288,20 @@ if __name__ == "__main__":
 
 			print(f"rendering {outname}")
 			image = testbed.render(args.width or int(ref_transforms["w"]), args.height or int(ref_transforms["h"]), args.screenshot_spp, True)
-			os.makedirs(os.path.dirname(outname), exist_ok=True)
-			write_image(outname, image)
+			# os.makedirs(os.path.dirname(outname), exist_ok=True)
+			# write_image(outname, image)
+		t2 = time.time()
+		print(f"Rendering took {t2-t1} seconds")
 	elif args.screenshot_dir:
 		outname = os.path.join(args.screenshot_dir, args.scene + "_" + network_stem)
 		print(f"Rendering {outname}.png")
+		t1 = time.time()
 		image = testbed.render(args.width or 1920, args.height or 1080, args.screenshot_spp, True)
 		if os.path.dirname(outname) != "":
 			os.makedirs(os.path.dirname(outname), exist_ok=True)
-		write_image(outname + ".png", image)
+		t2 = time.time()
+		print(f"Rendering took {t2-t1} seconds")
+		#write_image(outname + ".png", image)
 
 	if args.video_camera_path:
 		testbed.load_camera_path(args.video_camera_path)
@@ -308,11 +313,11 @@ if __name__ == "__main__":
 		if "tmp" in os.listdir():
 			shutil.rmtree("tmp")
 		os.makedirs("tmp")
-
+		t1 = time.time()
 		for i in tqdm(list(range(min(n_frames, n_frames+1))), unit="frames", desc=f"Rendering video"):
 			testbed.camera_smoothing = args.video_camera_smoothing
 			frame = testbed.render(resolution[0], resolution[1], args.video_spp, True, float(i)/n_frames, float(i + 1)/n_frames, args.video_fps, shutter_fraction=0.5)
 			write_image(f"tmp/{i:04d}.jpg", np.clip(frame * 2**args.exposure, 0.0, 1.0), quality=100)
-
-		os.system(f"ffmpeg -y -framerate {args.video_fps} -i tmp/%04d.jpg -c:v libx264 -pix_fmt yuv420p {args.video_output}")
+		print("Rendering took ", time.time() - t1, " seconds")
+		# os.system(f"ffmpeg -y -framerate {args.video_fps} -i tmp/%04d.jpg -c:v libx264 -pix_fmt yuv420p {args.video_output}")
 		shutil.rmtree("tmp")
